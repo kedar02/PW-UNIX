@@ -28,11 +28,13 @@ typedef struct {
   pid_t pid;
   int read_out_dsc;
   int read_err_dsc;
+  bool isActive; // Is not alive or zombie. (wait() was performed)
 } Task;
 
 Task tasks[MAX_N_TASKS];
 
 char out_buffer[MAX_OUT_SIZE+1];
+char err_buffer[MAX_OUT_SIZE+1];
 
 char ** words;
 char buffer[MAX_IN_SIZE];
@@ -52,6 +54,7 @@ void showArray(char* arr[])
 
 char * lastLine(char * s)
 {
+  //return s;
   int countEndLine = 0;
   char * it = s;
   while (*it != '\0')
@@ -73,6 +76,16 @@ char * lastLine(char * s)
   return ++it;
 }
 
+// bool addNewTask(pod_t child_pid, int read_out_dsc, int read_err_dsc)
+// {
+//   tasksSize++;
+//   tasks[tasksSize-1].pid = child_pid;
+//   tasks[tasksSize-1].read_out_dsc = pipe_dsc[0];
+//   tasks[tasksSize-1].read_err_dsc = pipe_err_dsc[0];
+//   tasks[tasksSize-1].isActive = false;
+//   return true;
+// }
+
 int main() 
 {
 
@@ -88,11 +101,11 @@ int main()
       good_command = true;
       int pipe_dsc[2];
       ASSERT_SYS_OK(pipe(pipe_dsc));
-     // fprintf(stderr, "Otwieram pipe, nr deskryptorow: read %d write %d\n", pipe_dsc[0], pipe_dsc[1]);
+      fprintf(stderr, "Otwieram pipe, nr deskryptorow: read %d write %d\n", pipe_dsc[0], pipe_dsc[1]);
 
       int pipe_err_dsc[2];
       ASSERT_SYS_OK(pipe(pipe_err_dsc));
-      //fprintf(stderr, "Otwieram pipe_err, nr deskryptorow: read %d write %d\n", pipe_err_dsc[0], pipe_err_dsc[1]);
+      fprintf(stderr, "Otwieram pipe_err, nr deskryptorow: read %d write %d\n", pipe_err_dsc[0], pipe_err_dsc[1]);
 
 
       pid_t child_pid;
@@ -114,16 +127,27 @@ int main()
         //fprintf(stderr, "Zamykam pipe_err, nr deskryptorow: read %d write %d\n", pipe_err_dsc[0], pipe_err_dsc[1]);
 
         ASSERT_SYS_OK(execvp(words[1], &words[1]));
+
       }
       else
       {
+        //sleep(1); //TODO
         // Parent process.
         tasksSize++;
         tasks[tasksSize-1].pid = child_pid;
         tasks[tasksSize-1].read_out_dsc = pipe_dsc[0];
         tasks[tasksSize-1].read_err_dsc = pipe_err_dsc[0];
+        tasks[tasksSize-1].isActive = true;
       }
     }
+
+    // if (strcmp(words[0], "out") == 0) {
+    //   good_command = true;
+    //   int T = atoi(words[1]);
+    //   fprintf(stderr, "Start out task %d.\n", T);
+    //   ASSERT_SYS_OK(read(tasks[T].read_out_dsc, out_buffer, sizeof(out_buffer)-1));
+    //   printf("Task %d stdout: %s.\n", T, lastLine(out_buffer));
+    // }
 
     if (strcmp(words[0], "out") == 0) {
       good_command = true;
@@ -135,8 +159,8 @@ int main()
     if (strcmp(words[0], "err") == 0) {
       good_command = true;
       int T = atoi(words[1]);
-      ASSERT_SYS_OK(read(tasks[T].read_err_dsc, out_buffer, sizeof(out_buffer)-1));
-      printf("Task %d stderr: %s.\n", T, lastLine(out_buffer));
+      ASSERT_SYS_OK(read(tasks[T].read_err_dsc, err_buffer, sizeof(err_buffer)-1));
+      printf("Task %d stderr: %s.\n", T, lastLine(err_buffer));
     }
 
     if (strcmp(words[0], "kill") == 0) {
@@ -172,6 +196,8 @@ int main()
     int exitStatus = 0, childPid;
     for (int i = 0; i < tasksSize; i++)
     {
+      if (tasks[i].isActive == false) // Child is already dead.
+        continue;
       ASSERT_SYS_OK(childPid = waitpid(tasks[i].pid, &exitStatus, WNOHANG));
       if (childPid == 0) { // Child is still active.
         fprintf(stderr, "Task %d is still active.\n", i);
@@ -180,7 +206,8 @@ int main()
       if (WIFEXITED(exitStatus) != 0)
         printf("Task %d ended: status %d.\n", i, exitStatus);
       else
-        printf("Task %d ended: signalled.\n", i);      
+        printf("Task %d ended: signalled.\n", i);     
+      tasks[i].isActive = false; 
     } 
   }
 
@@ -192,6 +219,8 @@ int main()
   // After end of input wait for all processes to finish:
   for (int i = 0; i < tasksSize; i++)
   {
+    if (tasks[i].isActive == false) // Child is already dead.
+      continue;
     fprintf(stderr, "Start waiting for task: %d\n", i);
     ASSERT_SYS_OK(childPid = waitpid(tasks[i].pid, &exitStatus, 0));
     if (childPid == 0) { // Child is already dead.
@@ -203,6 +232,7 @@ int main()
     else
       printf("Task %d ended: signalled.\n", i);      
     fprintf(stderr, "End waiting for pid: %d\n", i);
+    tasks[i].isActive = false; 
   } 
 
   return 0;
