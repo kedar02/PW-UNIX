@@ -8,12 +8,6 @@
 
 // TODO koniec linii w echo
     
-// #include <stdio.h>
-// #include <stdlib.h>
-// #include <sys/types.h>
-// #include <sys/wait.h>
-// #include <unistd.h>
-// #include <string.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <semaphore.h>
@@ -30,6 +24,7 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#include <pthread.h>
 
 #include "err.h"
 #include "utils.h"
@@ -45,8 +40,9 @@ typedef struct {
   int read_out_dsc;
   int read_err_dsc;
   char lastReadOut[MAX_OUT_SIZE];
-  bool wasReadOut;
+  char lastReadErr[MAX_OUT_SIZE];
   bool isActive; // Is not alive or zombie. (wait() was performed)
+  pthread_mutex_t mutex;
 } Task;
 
 // Storage compartment.
@@ -58,8 +54,11 @@ Task tasks[MAX_N_TASKS];
 
 struct SharedStorage* shared_storage;
 
-char out_buffer[MAX_OUT_SIZE+1];
-char err_buffer[MAX_OUT_SIZE+1];
+pthread_t readSTDOUT_threads[MAX_N_TASKS];
+pthread_t readSTDERR_threads[MAX_N_TASKS];
+
+//char out_buffer[MAX_OUT_SIZE+1];
+//char err_buffer[MAX_OUT_SIZE+1];
 
 char ** words;
 char buffer[MAX_IN_SIZE];
@@ -95,7 +94,50 @@ char * lastLine(char * s)
 void cleanStuff()
 {
   // Clean:
-  ASSERT_SYS_OK(sem_destroy(&shared_storage->mutex));
+  ASSERT_SYS_OK(sem_destroy(&(shared_storage->mutex)));
+  for (int i = 0; i < tasksSize; i++) {
+    ASSERT_SYS_OK(pthread_mutex_destroy(&(tasks[tasksSize].mutex)));
+  }
+}
+
+void* constantlyReadSTDOUT(void * data)
+{
+  Task * task = data;
+  fprintf(stdout, "Start thread reading STDOUT from task.\n");
+  FILE *stream = fdopen(task->read_out_dsc, "r");
+  if (!stream) {
+    fprintf(stderr, "Stream error :(\n");
+    exit(1);
+  }
+  char out_buffer[MAX_OUT_SIZE+1];
+  while (read_line(out_buffer, MAX_OUT_SIZE, stream)) {
+    ASSERT_SYS_OK(pthread_mutex_lock(&(task->mutex)));
+    fprintf(stderr, "Thread read out: %s\n", out_buffer);
+    strcpy(task -> lastReadOut, out_buffer);
+    ASSERT_SYS_OK(pthread_mutex_unlock(&(task->mutex)));
+  }
+  fprintf(stderr, "Exited reading thread loop\n");
+  return 0;
+}
+
+void* constantlyReadSTDERR(void * data)
+{
+  Task * task = data;
+  fprintf(stdout, "Start thread reading STDERR from task.\n");
+  FILE *stream = fdopen(task->read_err_dsc, "r");
+  if (!stream) {
+    fprintf(stderr, "Stream error :(\n");
+    exit(1);
+  }
+  char err_buffer[MAX_OUT_SIZE+1];
+  while (read_line(err_buffer, MAX_OUT_SIZE, stream)) {
+    ASSERT_SYS_OK(pthread_mutex_lock(&(task->mutex)));
+    fprintf(stderr, "Thread read err: %s\n", err_buffer);
+    strcpy(task -> lastReadErr, err_buffer);
+    ASSERT_SYS_OK(pthread_mutex_unlock(&(task->mutex)));
+  }
+  fprintf(stderr, "Exited reading thread loop\n");
+  return 0;
 }
 
 int main() 
@@ -113,7 +155,7 @@ int main()
       syserr("mmap");
 
   // Inicjalizacja semafora:
-  ASSERT_SYS_OK(sem_init(&shared_storage->mutex, 1, 1));
+  ASSERT_SYS_OK(sem_init(&(shared_storage->mutex), 1, 1));
 
   while (read_line(buffer, MAX_IN_SIZE, stdin)) {
 
@@ -166,16 +208,16 @@ int main()
         tasks[tasksSize-1].pid = child_pid;
         tasks[tasksSize-1].read_out_dsc = pipe_dsc[0];
         tasks[tasksSize-1].read_err_dsc = pipe_err_dsc[0];
-        tasks[tasksSize-1].wasReadOut = false;
+        //tasks[tasksSize-1].wasReadOut = false;
         tasks[tasksSize-1].isActive = true;
-      }
-    }
+        strcpy(tasks[tasksSize-1].lastReadOut, "");
+        strcpy(tasks[tasksSize-1].lastReadErr, "");
+        ASSERT_SYS_OK(pthread_mutex_init(&(tasks[tasksSize-1].mutex), 0));
 
-    if (strcmp(words[0], "out") == 0) {
-      good_command = true;
-      int T = atoi(words[1]);
-      ASSERT_SYS_OK(read(tasks[T].read_out_dsc, out_buffer, sizeof(out_buffer)-1));
-      printf("Task %d stdout: %s.\n", T, lastLine(out_buffer));
+        ASSERT_ZERO(pthread_create(&readSTDOUT_threads[tasksSize-1], NULL, constantlyReadSTDOUT, &tasks[tasksSize-1]));
+        ASSERT_ZERO(pthread_create(&readSTDERR_threads[tasksSize-1], NULL, constantlyReadSTDERR, &tasks[tasksSize-1]));
+        // TODO: add thread join
+      }
     }
 
     // if (strcmp(words[0], "out") == 0) {
@@ -189,10 +231,14 @@ int main()
     //     fprintf(stderr, "Stream error :(\n");
     //     return 1;
     //   }
-    //   while (read_line(out_buffer, MAX_OUT_SIZE, stream)) {
+    //   //char buffer[1024];
+    //   while (fgets(out_buffer, sizeof(out_buffer), stream) != NULL) {
+    //   //while (read_line(out_buffer, MAX_OUT_SIZE, stream)) {
     //     fprintf(stderr, "Jestem w petli!\n");
+    //     lastLine = out_buffer;
     //     fprintf(stderr, "Wczytalem: %s\n", lastLine);
     //     readLine = true;
+    //     //close(tasks[T].read_out_dsc);
     //   }
     //   fprintf(stderr, "Jestem tu!\n");
     //   if (readLine)
@@ -212,11 +258,23 @@ int main()
     //   printf("Task %d stdout: %s.\n", T, lastLine);
     // }
 
+    if (strcmp(words[0], "out") == 0) {
+      good_command = true;
+      int T = atoi(words[1]);
+      fprintf(stdout, "Start out task %d.\n", T);
+      ASSERT_SYS_OK(pthread_mutex_lock(&(tasks[tasksSize-1].mutex)));
+      printf("Task %d stdout: %s.\n", T, tasks[tasksSize-1].lastReadOut);
+      ASSERT_SYS_OK(pthread_mutex_unlock(&(tasks[tasksSize-1].mutex)));
+    }
+
+
     if (strcmp(words[0], "err") == 0) {
       good_command = true;
       int T = atoi(words[1]);
-      ASSERT_SYS_OK(read(tasks[T].read_err_dsc, err_buffer, sizeof(err_buffer)-1));
-      printf("Task %d stderr: %s.\n", T, lastLine(err_buffer));
+      fprintf(stdout, "Start err task %d.\n", T);
+      ASSERT_SYS_OK(pthread_mutex_lock(&(tasks[tasksSize-1].mutex)));
+      printf("Task %d stderr: %s.\n", T, tasks[tasksSize-1].lastReadErr);
+      ASSERT_SYS_OK(pthread_mutex_unlock(&(tasks[tasksSize-1].mutex)));
     }
 
     if (strcmp(words[0], "kill") == 0) {
@@ -224,7 +282,7 @@ int main()
       int T = atoi(words[1]);
       cleanStuff();
       fprintf(stderr, "Kill process: %d.\n", T);
-      ASSERT_SYS_OK(kill(tasks[T].pid, SIGINT));
+      ASSERT_SYS_OK(kill(tasks[T].pid, SIGKILL));
     }
 
     if (strcmp(words[0], "sleep") == 0) {
