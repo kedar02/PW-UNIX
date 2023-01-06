@@ -8,12 +8,28 @@
 
 // TODO koniec linii w echo
     
+// #include <stdio.h>
+// #include <stdlib.h>
+// #include <sys/types.h>
+// #include <sys/wait.h>
+// #include <unistd.h>
+// #include <string.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <semaphore.h>
+#include <assert.h>
+#include <fcntl.h> // For O_* constants.
+#include <semaphore.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/stat.h> // For mode constants.
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
-#include <string.h>
 
 #include "err.h"
 #include "utils.h"
@@ -28,10 +44,19 @@ typedef struct {
   pid_t pid;
   int read_out_dsc;
   int read_err_dsc;
+  char lastReadOut[MAX_OUT_SIZE];
+  bool wasReadOut;
   bool isActive; // Is not alive or zombie. (wait() was performed)
 } Task;
 
+// Storage compartment.
+struct SharedStorage {
+    sem_t mutex;
+};
+
 Task tasks[MAX_N_TASKS];
+
+struct SharedStorage* shared_storage;
 
 char out_buffer[MAX_OUT_SIZE+1];
 char err_buffer[MAX_OUT_SIZE+1];
@@ -42,15 +67,6 @@ char buffer[MAX_IN_SIZE];
 int tasksSize = 0;
 
 bool good_command = false;
-
-void showArray(char* arr[])
-{
-  int i = 0;
-  while(arr[i] != NULL) {
-    printf("arr[i]: %sEND\n", arr[i]);
-    i++;
-  }
-}
 
 char * lastLine(char * s)
 {
@@ -76,18 +92,28 @@ char * lastLine(char * s)
   return ++it;
 }
 
-// bool addNewTask(pod_t child_pid, int read_out_dsc, int read_err_dsc)
-// {
-//   tasksSize++;
-//   tasks[tasksSize-1].pid = child_pid;
-//   tasks[tasksSize-1].read_out_dsc = pipe_dsc[0];
-//   tasks[tasksSize-1].read_err_dsc = pipe_err_dsc[0];
-//   tasks[tasksSize-1].isActive = false;
-//   return true;
-// }
+void cleanStuff()
+{
+  // Clean:
+  ASSERT_SYS_OK(sem_destroy(&shared_storage->mutex));
+}
 
 int main() 
 {
+  // Create shared storage.
+  shared_storage = mmap(
+      NULL,
+      sizeof(struct SharedStorage),
+      PROT_READ | PROT_WRITE,
+      MAP_SHARED | MAP_ANONYMOUS,
+      -1,
+      0);
+
+  if (shared_storage == MAP_FAILED)
+      syserr("mmap");
+
+  // Inicjalizacja semafora:
+  ASSERT_SYS_OK(sem_init(&shared_storage->mutex, 1, 1));
 
   while (read_line(buffer, MAX_IN_SIZE, stdin)) {
 
@@ -101,12 +127,13 @@ int main()
       good_command = true;
       int pipe_dsc[2];
       ASSERT_SYS_OK(pipe(pipe_dsc));
-      fprintf(stderr, "Otwieram pipe, nr deskryptorow: read %d write %d\n", pipe_dsc[0], pipe_dsc[1]);
+      //fprintf(stderr, "Otwieram pipe, nr deskryptorow: read %d write %d\n", pipe_dsc[0], pipe_dsc[1]);
 
       int pipe_err_dsc[2];
       ASSERT_SYS_OK(pipe(pipe_err_dsc));
-      fprintf(stderr, "Otwieram pipe_err, nr deskryptorow: read %d write %d\n", pipe_err_dsc[0], pipe_err_dsc[1]);
+      //fprintf(stderr, "Otwieram pipe_err, nr deskryptorow: read %d write %d\n", pipe_err_dsc[0], pipe_err_dsc[1]);
 
+      ASSERT_SYS_OK(sem_wait(&(shared_storage->mutex)));
 
       pid_t child_pid;
       ASSERT_SYS_OK(child_pid = fork());
@@ -126,28 +153,23 @@ int main()
         ASSERT_SYS_OK(close(pipe_err_dsc[1])); 
         //fprintf(stderr, "Zamykam pipe_err, nr deskryptorow: read %d write %d\n", pipe_err_dsc[0], pipe_err_dsc[1]);
 
+        ASSERT_SYS_OK(sem_post(&(shared_storage->mutex)));
+
         ASSERT_SYS_OK(execvp(words[1], &words[1]));
 
       }
       else
       {
-        //sleep(1); //TODO
+      ASSERT_SYS_OK(sem_wait(&(shared_storage->mutex)));
         // Parent process.
         tasksSize++;
         tasks[tasksSize-1].pid = child_pid;
         tasks[tasksSize-1].read_out_dsc = pipe_dsc[0];
         tasks[tasksSize-1].read_err_dsc = pipe_err_dsc[0];
+        tasks[tasksSize-1].wasReadOut = false;
         tasks[tasksSize-1].isActive = true;
       }
     }
-
-    // if (strcmp(words[0], "out") == 0) {
-    //   good_command = true;
-    //   int T = atoi(words[1]);
-    //   fprintf(stderr, "Start out task %d.\n", T);
-    //   ASSERT_SYS_OK(read(tasks[T].read_out_dsc, out_buffer, sizeof(out_buffer)-1));
-    //   printf("Task %d stdout: %s.\n", T, lastLine(out_buffer));
-    // }
 
     if (strcmp(words[0], "out") == 0) {
       good_command = true;
@@ -155,6 +177,40 @@ int main()
       ASSERT_SYS_OK(read(tasks[T].read_out_dsc, out_buffer, sizeof(out_buffer)-1));
       printf("Task %d stdout: %s.\n", T, lastLine(out_buffer));
     }
+
+    // if (strcmp(words[0], "out") == 0) {
+    //   good_command = true;
+    //   bool readLine = false;
+    //   char * lastLine;
+    //   int T = atoi(words[1]);
+    //   fprintf(stdout, "Start out task %d.\n", T);
+    //   FILE *stream = fdopen(tasks[T].read_out_dsc, "r");
+    //   if (!stream) {
+    //     fprintf(stderr, "Stream error :(\n");
+    //     return 1;
+    //   }
+    //   while (read_line(out_buffer, MAX_OUT_SIZE, stream)) {
+    //     fprintf(stderr, "Jestem w petli!\n");
+    //     fprintf(stderr, "Wczytalem: %s\n", lastLine);
+    //     readLine = true;
+    //   }
+    //   fprintf(stderr, "Jestem tu!\n");
+    //   if (readLine)
+    //   {
+    //     lastLine = out_buffer;
+    //   }
+    //   else
+    //   {
+    //     if (tasks[T].wasReadOut) {
+    //       lastLine = tasks[T].lastReadOut;
+    //     }
+    //     else {
+    //       lastLine = "";
+    //     }
+    //   }
+    //   //ASSERT_SYS_OK(read(tasks[T].read_out_dsc, out_buffer, sizeof(out_buffer)-1));
+    //   printf("Task %d stdout: %s.\n", T, lastLine);
+    // }
 
     if (strcmp(words[0], "err") == 0) {
       good_command = true;
@@ -166,6 +222,7 @@ int main()
     if (strcmp(words[0], "kill") == 0) {
       good_command = true;
       int T = atoi(words[1]);
+      cleanStuff();
       fprintf(stderr, "Kill process: %d.\n", T);
       ASSERT_SYS_OK(kill(tasks[T].pid, SIGINT));
     }
@@ -234,6 +291,8 @@ int main()
     fprintf(stderr, "End waiting for pid: %d\n", i);
     tasks[i].isActive = false; 
   } 
+
+  cleanStuff();
 
   return 0;
 }
