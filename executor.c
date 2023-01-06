@@ -1,13 +1,3 @@
-// W rozwiązaniu tego zadania będziemy potrzebować kilku mechanizmów z biblioteki standardowej C++ oraz biblioteki Unixa. W szczególności będziemy potrzebować:
-
-//     fork() - funkcji do tworzenia procesów potomnych
-//     pipe() - funkcji do tworzenia potoków (ang. pipes) do przesyłania danych między procesami
-//     dup2() - funkcji do przekierowywania wejścia/wyjścia plików
-//     execvp() - funkcji do uruchamiania programów w innych procesach
-//     waitpid() - funkcji do oczekiwania na zakończenie działania procesu potomnego
-
-// TODO koniec linii w echo
-    
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <semaphore.h>
@@ -57,9 +47,6 @@ struct SharedStorage* shared_storage;
 pthread_t readSTDOUT_threads[MAX_N_TASKS];
 pthread_t readSTDERR_threads[MAX_N_TASKS];
 
-//char out_buffer[MAX_OUT_SIZE+1];
-//char err_buffer[MAX_OUT_SIZE+1];
-
 char ** words;
 char buffer[MAX_IN_SIZE];
 
@@ -67,35 +54,17 @@ int tasksSize = 0;
 
 bool good_command = false;
 
-char * lastLine(char * s)
-{
-  //return s;
-  int countEndLine = 0;
-  char * it = s;
-  while (*it != '\0')
-  {
-    if (*it == '\n') countEndLine++;
-    it++;
-  }
-  if (countEndLine == 0)
-    return s;
-  it--;
-  if (*it == '\n')
-  {
-    *it = '\0';
-    if (countEndLine == 1)
-      return s;
-  }
-  while (*it != '\n')
-    it--;
-  return ++it;
-}
-
 void cleanStuff()
 {
+  close(3);
+  close(4);
   // Clean:
   ASSERT_SYS_OK(sem_destroy(&(shared_storage->mutex)));
   for (int i = 0; i < tasksSize; i++) {
+    close(tasks[i].read_err_dsc);
+    close(tasks[i].read_out_dsc);
+    ASSERT_ZERO(pthread_join(readSTDOUT_threads[i], NULL));
+    ASSERT_ZERO(pthread_join(readSTDERR_threads[i], NULL));
     ASSERT_SYS_OK(pthread_mutex_destroy(&(tasks[tasksSize].mutex)));
   }
 }
@@ -103,7 +72,7 @@ void cleanStuff()
 void* constantlyReadSTDOUT(void * data)
 {
   Task * task = data;
-  fprintf(stdout, "Start thread reading STDOUT from task.\n");
+  fprintf(stderr, "Start thread reading STDOUT from task.\n");
   FILE *stream = fdopen(task->read_out_dsc, "r");
   if (!stream) {
     fprintf(stderr, "Stream error :(\n");
@@ -112,9 +81,11 @@ void* constantlyReadSTDOUT(void * data)
   char out_buffer[MAX_OUT_SIZE+1];
   while (read_line(out_buffer, MAX_OUT_SIZE, stream)) {
     ASSERT_SYS_OK(pthread_mutex_lock(&(task->mutex)));
+    out_buffer[strcspn(out_buffer, "\n")] = '\0'; // Delete newline sign.
     fprintf(stderr, "Thread read out: %s\n", out_buffer);
     strcpy(task -> lastReadOut, out_buffer);
     ASSERT_SYS_OK(pthread_mutex_unlock(&(task->mutex)));
+    close(3);
   }
   fprintf(stderr, "Exited reading thread loop\n");
   return 0;
@@ -123,7 +94,7 @@ void* constantlyReadSTDOUT(void * data)
 void* constantlyReadSTDERR(void * data)
 {
   Task * task = data;
-  fprintf(stdout, "Start thread reading STDERR from task.\n");
+  fprintf(stderr, "Start thread reading STDERR from task.\n");
   FILE *stream = fdopen(task->read_err_dsc, "r");
   if (!stream) {
     fprintf(stderr, "Stream error :(\n");
@@ -132,9 +103,11 @@ void* constantlyReadSTDERR(void * data)
   char err_buffer[MAX_OUT_SIZE+1];
   while (read_line(err_buffer, MAX_OUT_SIZE, stream)) {
     ASSERT_SYS_OK(pthread_mutex_lock(&(task->mutex)));
+    err_buffer[strcspn(err_buffer, "\n")] = '\0'; // Delete newline sign.
     fprintf(stderr, "Thread read err: %s\n", err_buffer);
     strcpy(task -> lastReadErr, err_buffer);
     ASSERT_SYS_OK(pthread_mutex_unlock(&(task->mutex)));
+    close(5);
   }
   fprintf(stderr, "Exited reading thread loop\n");
   return 0;
@@ -169,11 +142,11 @@ int main()
       good_command = true;
       int pipe_dsc[2];
       ASSERT_SYS_OK(pipe(pipe_dsc));
-      //fprintf(stderr, "Otwieram pipe, nr deskryptorow: read %d write %d\n", pipe_dsc[0], pipe_dsc[1]);
+      fprintf(stderr, "Otwieram pipe, nr deskryptorow: read %d write %d\n", pipe_dsc[0], pipe_dsc[1]);
 
       int pipe_err_dsc[2];
       ASSERT_SYS_OK(pipe(pipe_err_dsc));
-      //fprintf(stderr, "Otwieram pipe_err, nr deskryptorow: read %d write %d\n", pipe_err_dsc[0], pipe_err_dsc[1]);
+      fprintf(stderr, "Otwieram pipe_err, nr deskryptorow: read %d write %d\n", pipe_err_dsc[0], pipe_err_dsc[1]);
 
       ASSERT_SYS_OK(sem_wait(&(shared_storage->mutex)));
 
@@ -202,13 +175,12 @@ int main()
       }
       else
       {
-      ASSERT_SYS_OK(sem_wait(&(shared_storage->mutex)));
+        ASSERT_SYS_OK(sem_wait(&(shared_storage->mutex)));
         // Parent process.
         tasksSize++;
         tasks[tasksSize-1].pid = child_pid;
         tasks[tasksSize-1].read_out_dsc = pipe_dsc[0];
         tasks[tasksSize-1].read_err_dsc = pipe_err_dsc[0];
-        //tasks[tasksSize-1].wasReadOut = false;
         tasks[tasksSize-1].isActive = true;
         strcpy(tasks[tasksSize-1].lastReadOut, "");
         strcpy(tasks[tasksSize-1].lastReadErr, "");
@@ -217,64 +189,28 @@ int main()
         ASSERT_ZERO(pthread_create(&readSTDOUT_threads[tasksSize-1], NULL, constantlyReadSTDOUT, &tasks[tasksSize-1]));
         ASSERT_ZERO(pthread_create(&readSTDERR_threads[tasksSize-1], NULL, constantlyReadSTDERR, &tasks[tasksSize-1]));
         // TODO: add thread join
+
+        ASSERT_SYS_OK(sem_post(&(shared_storage->mutex)));
       }
     }
-
-    // if (strcmp(words[0], "out") == 0) {
-    //   good_command = true;
-    //   bool readLine = false;
-    //   char * lastLine;
-    //   int T = atoi(words[1]);
-    //   fprintf(stdout, "Start out task %d.\n", T);
-    //   FILE *stream = fdopen(tasks[T].read_out_dsc, "r");
-    //   if (!stream) {
-    //     fprintf(stderr, "Stream error :(\n");
-    //     return 1;
-    //   }
-    //   //char buffer[1024];
-    //   while (fgets(out_buffer, sizeof(out_buffer), stream) != NULL) {
-    //   //while (read_line(out_buffer, MAX_OUT_SIZE, stream)) {
-    //     fprintf(stderr, "Jestem w petli!\n");
-    //     lastLine = out_buffer;
-    //     fprintf(stderr, "Wczytalem: %s\n", lastLine);
-    //     readLine = true;
-    //     //close(tasks[T].read_out_dsc);
-    //   }
-    //   fprintf(stderr, "Jestem tu!\n");
-    //   if (readLine)
-    //   {
-    //     lastLine = out_buffer;
-    //   }
-    //   else
-    //   {
-    //     if (tasks[T].wasReadOut) {
-    //       lastLine = tasks[T].lastReadOut;
-    //     }
-    //     else {
-    //       lastLine = "";
-    //     }
-    //   }
-    //   //ASSERT_SYS_OK(read(tasks[T].read_out_dsc, out_buffer, sizeof(out_buffer)-1));
-    //   printf("Task %d stdout: %s.\n", T, lastLine);
-    // }
 
     if (strcmp(words[0], "out") == 0) {
       good_command = true;
       int T = atoi(words[1]);
-      fprintf(stdout, "Start out task %d.\n", T);
-      ASSERT_SYS_OK(pthread_mutex_lock(&(tasks[tasksSize-1].mutex)));
-      printf("Task %d stdout: %s.\n", T, tasks[tasksSize-1].lastReadOut);
-      ASSERT_SYS_OK(pthread_mutex_unlock(&(tasks[tasksSize-1].mutex)));
+      fprintf(stderr, "Start out task %d.\n", T);
+      ASSERT_SYS_OK(pthread_mutex_lock(&(tasks[T].mutex)));
+      printf("Task %d stdout: %s.\n", T, tasks[T].lastReadOut);
+      ASSERT_SYS_OK(pthread_mutex_unlock(&(tasks[T].mutex)));
     }
 
 
     if (strcmp(words[0], "err") == 0) {
       good_command = true;
       int T = atoi(words[1]);
-      fprintf(stdout, "Start err task %d.\n", T);
-      ASSERT_SYS_OK(pthread_mutex_lock(&(tasks[tasksSize-1].mutex)));
-      printf("Task %d stderr: %s.\n", T, tasks[tasksSize-1].lastReadErr);
-      ASSERT_SYS_OK(pthread_mutex_unlock(&(tasks[tasksSize-1].mutex)));
+      fprintf(stderr, "Start err task %d.\n", T);
+      ASSERT_SYS_OK(pthread_mutex_lock(&(tasks[T].mutex)));
+      printf("Task %d stderr: %s.\n", T, tasks[T].lastReadErr);
+      ASSERT_SYS_OK(pthread_mutex_unlock(&(tasks[T].mutex)));
     }
 
     if (strcmp(words[0], "kill") == 0) {
@@ -282,7 +218,7 @@ int main()
       int T = atoi(words[1]);
       cleanStuff();
       fprintf(stderr, "Kill process: %d.\n", T);
-      ASSERT_SYS_OK(kill(tasks[T].pid, SIGKILL));
+      ASSERT_SYS_OK(kill(tasks[T].pid, SIGINT));
     }
 
     if (strcmp(words[0], "sleep") == 0) {
@@ -294,9 +230,15 @@ int main()
 
     if (strcmp(words[0], "quit") == 0) {
       good_command = true;
-      fprintf(stderr, "Quit.\n");
+      for (int i = 0; i < tasksSize; i++)
+      {
+        if (tasks[i].isActive == false) // Child is already dead.
+          continue;
+        ASSERT_SYS_OK(kill(tasks[i].pid, SIGKILL));
+      }
       free_split_string(words);
-      break;
+      fprintf(stderr, "Quit.\n");
+      return 1;
     }
 
     if (!good_command) {
@@ -315,7 +257,7 @@ int main()
         continue;
       ASSERT_SYS_OK(childPid = waitpid(tasks[i].pid, &exitStatus, WNOHANG));
       if (childPid == 0) { // Child is still active.
-        fprintf(stderr, "Task %d is still active.\n", i);
+        //fprintf(stderr, "Task %d is still active.\n", i);
         continue;
       }
       if (WIFEXITED(exitStatus) != 0)
