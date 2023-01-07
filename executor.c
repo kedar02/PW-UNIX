@@ -112,6 +112,7 @@ void* constantlyReadSTDOUT(void * data)
     ASSERT_SYS_OK(pthread_mutex_unlock(&(task->mutex)));
     //close(3);
   }
+  fclose(stream);
   fprintf(stderr, "Exited reading thread loop\n");
   return 0;
 }
@@ -134,6 +135,7 @@ void* constantlyReadSTDERR(void * data)
     ASSERT_SYS_OK(pthread_mutex_unlock(&(task->mutex)));
     //close(5);
   }
+  fclose(stream);
   fprintf(stderr, "Exited reading thread loop\n");
   return 0;
 }
@@ -186,12 +188,10 @@ int main()
         ASSERT_SYS_OK(dup2(pipe_dsc[1], STDOUT_FILENO));
         ASSERT_SYS_OK(close(pipe_dsc[0]));
         ASSERT_SYS_OK(close(pipe_dsc[1])); 
-        //fprintf(stderr, "Zamykam pipe, nr deskryptorow: read %d write %d\n", pipe_dsc[0], pipe_dsc[1]);
 
         ASSERT_SYS_OK(dup2(pipe_err_dsc[1], STDERR_FILENO));
         ASSERT_SYS_OK(close(pipe_err_dsc[0]));
         ASSERT_SYS_OK(close(pipe_err_dsc[1])); 
-        //fprintf(stderr, "Zamykam pipe_err, nr deskryptorow: read %d write %d\n", pipe_err_dsc[0], pipe_err_dsc[1]);
 
         ASSERT_SYS_OK(sem_post(&(shared_storage->mutex)));
 
@@ -276,52 +276,9 @@ int main()
     }
 
     free_split_string(words);
-    //free(buffer);
-
-    // Look for already dead processes:
-    // int exitStatus = 0;
-    // pid_t childPid;
-    // for (int i = 0; i < tasksSize; i++)
-    // {
-    //   if (tasks[i].isActive == false) // Child is already dead.
-    //     continue;
-    //   ASSERT_SYS_OK(childPid = waitpid(tasks[i].pid, &exitStatus, WNOHANG));
-    //   if (childPid == 0) { // Child is still active.
-    //     //fprintf(stderr, "Task %d is still active.\n", i);
-    //     continue;
-    //   }
-    //   if (WIFEXITED(exitStatus) != 0)
-    //     printf("Task %d ended: status %d.\n", i, exitStatus);
-    //   else
-    //     printf("Task %d ended: signalled.\n", i);     
-    //   tasks[i].isActive = false; 
-    // } 
   }
 
   fprintf(stderr, "End of while loop\n");
-
-  //fprintf(stderr, "Num of tasks: %d\n", tasksSize);
-
-  // int exitStatus = 0;
-  // pid_t childPid;
-  // // After end of input wait for all processes to finish:
-  // for (int i = 0; i < tasksSize; i++)
-  // {
-  //   if (tasks[i].isActive == false) // Child is already dead.
-  //     continue;
-  //   fprintf(stderr, "Start waiting for task: %d\n", i);
-  //   ASSERT_SYS_OK(childPid = waitpid(tasks[i].pid, &exitStatus, 0));
-  //   if (childPid == 0) { // Child is already dead.
-  //     fprintf(stderr, "Task %d is already dead.\n", i);
-  //     continue;
-  //   }
-  //   if (WIFEXITED(exitStatus) != 0)
-  //     printf("Task %d ended: status %d.\n", i, exitStatus);
-  //   else
-  //     printf("Task %d ended: signalled.\n", i);      
-  //   fprintf(stderr, "End waiting for pid: %d\n", i);
-  //   tasks[i].isActive = false; 
-  // } 
 
   cleanStuff();
 
