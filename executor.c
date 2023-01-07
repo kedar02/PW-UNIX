@@ -29,6 +29,9 @@ typedef struct {
   pid_t pid;
   int read_out_dsc;
   int read_err_dsc;
+  int write_out_dsc;
+  int write_err_dsc;
+  int nr;
   char lastReadOut[MAX_OUT_SIZE];
   char lastReadErr[MAX_OUT_SIZE];
   bool isActive; // Is not alive or zombie. (wait() was performed)
@@ -46,6 +49,7 @@ struct SharedStorage* shared_storage;
 
 pthread_t readSTDOUT_threads[MAX_N_TASKS];
 pthread_t readSTDERR_threads[MAX_N_TASKS];
+pthread_t wait_threads[MAX_N_TASKS];
 
 char ** words;
 char buffer[MAX_IN_SIZE];
@@ -56,17 +60,38 @@ bool good_command = false;
 
 void cleanStuff()
 {
-  close(3);
-  close(4);
   // Clean:
   ASSERT_SYS_OK(sem_destroy(&(shared_storage->mutex)));
   for (int i = 0; i < tasksSize; i++) {
+    ASSERT_ZERO(pthread_join(wait_threads[i], NULL));
     close(tasks[i].read_err_dsc);
     close(tasks[i].read_out_dsc);
+    close(tasks[i].write_err_dsc);
+    close(tasks[i].write_out_dsc);
     ASSERT_ZERO(pthread_join(readSTDOUT_threads[i], NULL));
     ASSERT_ZERO(pthread_join(readSTDERR_threads[i], NULL));
     ASSERT_SYS_OK(pthread_mutex_destroy(&(tasks[tasksSize].mutex)));
   }
+}
+
+void* constantlyWait(void * data)
+{
+  Task * task = data;
+  fprintf(stderr, "Start thread waiting for task: %d.\n", task -> nr);
+  pid_t childPid;
+  int exitStatus, i = task -> nr;
+  ASSERT_SYS_OK(childPid = waitpid(task -> pid, &exitStatus, 0));
+  if (childPid == 0) { // Child is already dead.
+    fprintf(stderr, "Task %d is already dead.\n", i);
+    return 0;
+  }
+  if (WIFEXITED(exitStatus) != 0)
+    printf("Task %d ended: status %d.\n", i, exitStatus);
+  else
+    printf("Task %d ended: signalled.\n", i);      
+  tasks[i].isActive = false; 
+  fprintf(stderr, "Finish thread waiting for pid: %d\n", task -> pid);
+  return 0;
 }
 
 void* constantlyReadSTDOUT(void * data)
@@ -85,7 +110,7 @@ void* constantlyReadSTDOUT(void * data)
     fprintf(stderr, "Thread read out: %s\n", out_buffer);
     strcpy(task -> lastReadOut, out_buffer);
     ASSERT_SYS_OK(pthread_mutex_unlock(&(task->mutex)));
-    close(3);
+    //close(3);
   }
   fprintf(stderr, "Exited reading thread loop\n");
   return 0;
@@ -107,7 +132,7 @@ void* constantlyReadSTDERR(void * data)
     fprintf(stderr, "Thread read err: %s\n", err_buffer);
     strcpy(task -> lastReadErr, err_buffer);
     ASSERT_SYS_OK(pthread_mutex_unlock(&(task->mutex)));
-    close(5);
+    //close(5);
   }
   fprintf(stderr, "Exited reading thread loop\n");
   return 0;
@@ -181,6 +206,9 @@ int main()
         tasks[tasksSize-1].pid = child_pid;
         tasks[tasksSize-1].read_out_dsc = pipe_dsc[0];
         tasks[tasksSize-1].read_err_dsc = pipe_err_dsc[0];
+        tasks[tasksSize-1].write_out_dsc = pipe_dsc[1];
+        tasks[tasksSize-1].write_err_dsc = pipe_err_dsc[1];
+        tasks[tasksSize-1].nr = tasksSize - 1;
         tasks[tasksSize-1].isActive = true;
         strcpy(tasks[tasksSize-1].lastReadOut, "");
         strcpy(tasks[tasksSize-1].lastReadErr, "");
@@ -188,7 +216,8 @@ int main()
 
         ASSERT_ZERO(pthread_create(&readSTDOUT_threads[tasksSize-1], NULL, constantlyReadSTDOUT, &tasks[tasksSize-1]));
         ASSERT_ZERO(pthread_create(&readSTDERR_threads[tasksSize-1], NULL, constantlyReadSTDERR, &tasks[tasksSize-1]));
-        // TODO: add thread join
+
+        ASSERT_ZERO(pthread_create(&wait_threads[tasksSize-1], NULL, constantlyWait, &tasks[tasksSize-1]));
 
         ASSERT_SYS_OK(sem_post(&(shared_storage->mutex)));
       }
@@ -216,7 +245,6 @@ int main()
     if (strcmp(words[0], "kill") == 0) {
       good_command = true;
       int T = atoi(words[1]);
-      cleanStuff();
       fprintf(stderr, "Kill process: %d.\n", T);
       ASSERT_SYS_OK(kill(tasks[T].pid, SIGINT));
     }
@@ -237,12 +265,13 @@ int main()
         ASSERT_SYS_OK(kill(tasks[i].pid, SIGKILL));
       }
       free_split_string(words);
+      cleanStuff();
       fprintf(stderr, "Quit.\n");
       return 1;
     }
 
     if (!good_command) {
-      fprintf(stderr, "Command not found!!!\n");
+      fprintf(stderr, "Command: \"%s\" not found :(\n", words[0]);
       return 1;
     }
 
@@ -250,47 +279,49 @@ int main()
     //free(buffer);
 
     // Look for already dead processes:
-    int exitStatus = 0, childPid;
-    for (int i = 0; i < tasksSize; i++)
-    {
-      if (tasks[i].isActive == false) // Child is already dead.
-        continue;
-      ASSERT_SYS_OK(childPid = waitpid(tasks[i].pid, &exitStatus, WNOHANG));
-      if (childPid == 0) { // Child is still active.
-        //fprintf(stderr, "Task %d is still active.\n", i);
-        continue;
-      }
-      if (WIFEXITED(exitStatus) != 0)
-        printf("Task %d ended: status %d.\n", i, exitStatus);
-      else
-        printf("Task %d ended: signalled.\n", i);     
-      tasks[i].isActive = false; 
-    } 
+    // int exitStatus = 0;
+    // pid_t childPid;
+    // for (int i = 0; i < tasksSize; i++)
+    // {
+    //   if (tasks[i].isActive == false) // Child is already dead.
+    //     continue;
+    //   ASSERT_SYS_OK(childPid = waitpid(tasks[i].pid, &exitStatus, WNOHANG));
+    //   if (childPid == 0) { // Child is still active.
+    //     //fprintf(stderr, "Task %d is still active.\n", i);
+    //     continue;
+    //   }
+    //   if (WIFEXITED(exitStatus) != 0)
+    //     printf("Task %d ended: status %d.\n", i, exitStatus);
+    //   else
+    //     printf("Task %d ended: signalled.\n", i);     
+    //   tasks[i].isActive = false; 
+    // } 
   }
 
   fprintf(stderr, "End of while loop\n");
 
   //fprintf(stderr, "Num of tasks: %d\n", tasksSize);
 
-  int exitStatus = 0, childPid;
-  // After end of input wait for all processes to finish:
-  for (int i = 0; i < tasksSize; i++)
-  {
-    if (tasks[i].isActive == false) // Child is already dead.
-      continue;
-    fprintf(stderr, "Start waiting for task: %d\n", i);
-    ASSERT_SYS_OK(childPid = waitpid(tasks[i].pid, &exitStatus, 0));
-    if (childPid == 0) { // Child is already dead.
-      fprintf(stderr, "Task %d is already dead.\n", i);
-      continue;
-    }
-    if (WIFEXITED(exitStatus) != 0)
-      printf("Task %d ended: status %d.\n", i, exitStatus);
-    else
-      printf("Task %d ended: signalled.\n", i);      
-    fprintf(stderr, "End waiting for pid: %d\n", i);
-    tasks[i].isActive = false; 
-  } 
+  // int exitStatus = 0;
+  // pid_t childPid;
+  // // After end of input wait for all processes to finish:
+  // for (int i = 0; i < tasksSize; i++)
+  // {
+  //   if (tasks[i].isActive == false) // Child is already dead.
+  //     continue;
+  //   fprintf(stderr, "Start waiting for task: %d\n", i);
+  //   ASSERT_SYS_OK(childPid = waitpid(tasks[i].pid, &exitStatus, 0));
+  //   if (childPid == 0) { // Child is already dead.
+  //     fprintf(stderr, "Task %d is already dead.\n", i);
+  //     continue;
+  //   }
+  //   if (WIFEXITED(exitStatus) != 0)
+  //     printf("Task %d ended: status %d.\n", i, exitStatus);
+  //   else
+  //     printf("Task %d ended: signalled.\n", i);      
+  //   fprintf(stderr, "End waiting for pid: %d\n", i);
+  //   tasks[i].isActive = false; 
+  // } 
 
   cleanStuff();
 
