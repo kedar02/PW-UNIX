@@ -86,7 +86,7 @@ void* constantlyWait(void * data)
     return 0;
   }
   if (WIFEXITED(exitStatus) != 0)
-    printf("Task %d ended: status %d.\n", i, exitStatus);
+    printf("Task %d ended: status %d.\n", i, WEXITSTATUS(exitStatus));
   else
     printf("Task %d ended: signalled.\n", i);      
   tasks[i].isActive = false; 
@@ -140,6 +140,16 @@ void* constantlyReadSTDERR(void * data)
   return 0;
 }
 
+void endExec()
+{
+  for (int i = 0; i < tasksSize; i++)
+  {
+    if (tasks[i].isActive == false) // Child is already dead.
+      continue;
+    ASSERT_SYS_OK(kill(tasks[i].pid, SIGKILL));
+  }
+}
+
 int main() 
 {
   // Create shared storage.
@@ -183,7 +193,6 @@ int main()
       if (!child_pid)
       {
         // Child process.
-        printf("Task %d started: pid %d.\n", tasksSize, getpid());
 
         ASSERT_SYS_OK(dup2(pipe_dsc[1], STDOUT_FILENO));
         ASSERT_SYS_OK(close(pipe_dsc[0]));
@@ -219,6 +228,8 @@ int main()
 
         ASSERT_ZERO(pthread_create(&wait_threads[tasksSize-1], NULL, constantlyWait, &tasks[tasksSize-1]));
 
+        printf("Task %d started: pid %d.\n", tasksSize-1, getpid());
+
         ASSERT_SYS_OK(sem_post(&(shared_storage->mutex)));
       }
     }
@@ -228,7 +239,7 @@ int main()
       int T = atoi(words[1]);
       fprintf(stderr, "Start out task %d.\n", T);
       ASSERT_SYS_OK(pthread_mutex_lock(&(tasks[T].mutex)));
-      printf("Task %d stdout: %s.\n", T, tasks[T].lastReadOut);
+      printf("Task %d stdout: \'%s\'.\n", T, tasks[T].lastReadOut);
       ASSERT_SYS_OK(pthread_mutex_unlock(&(tasks[T].mutex)));
     }
 
@@ -238,7 +249,7 @@ int main()
       int T = atoi(words[1]);
       fprintf(stderr, "Start err task %d.\n", T);
       ASSERT_SYS_OK(pthread_mutex_lock(&(tasks[T].mutex)));
-      printf("Task %d stderr: %s.\n", T, tasks[T].lastReadErr);
+      printf("Task %d stderr: \'%s\'.\n", T, tasks[T].lastReadErr);
       ASSERT_SYS_OK(pthread_mutex_unlock(&(tasks[T].mutex)));
     }
 
@@ -246,7 +257,8 @@ int main()
       good_command = true;
       int T = atoi(words[1]);
       fprintf(stderr, "Kill process: %d.\n", T);
-      ASSERT_SYS_OK(kill(tasks[T].pid, SIGINT));
+      if (tasks[T].isActive)
+        ASSERT_SYS_OK(kill(tasks[T].pid, SIGINT));
     }
 
     if (strcmp(words[0], "sleep") == 0) {
@@ -256,18 +268,17 @@ int main()
       usleep(N*1000);
     }
 
+    if (strcmp(words[0], "") == 0) {
+      // Just empty line.
+      good_command = true;
+    }
+
     if (strcmp(words[0], "quit") == 0) {
       good_command = true;
-      for (int i = 0; i < tasksSize; i++)
-      {
-        if (tasks[i].isActive == false) // Child is already dead.
-          continue;
-        ASSERT_SYS_OK(kill(tasks[i].pid, SIGKILL));
-      }
-      free_split_string(words);
-      cleanStuff();
       fprintf(stderr, "Quit.\n");
-      return 1;
+      endExec();
+      free_split_string(words);
+      break;
     }
 
     if (!good_command) {
@@ -279,6 +290,8 @@ int main()
   }
 
   fprintf(stderr, "End of while loop\n");
+
+  endExec();
 
   cleanStuff();
 
