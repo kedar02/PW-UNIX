@@ -15,6 +15,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <errno.h>
 
 #include "err.h"
 #include "utils.h"
@@ -34,13 +35,13 @@ typedef struct {
   int nr;
   char lastReadOut[MAX_OUT_SIZE];
   char lastReadErr[MAX_OUT_SIZE];
-  bool isActive; // Is not alive or zombie. (wait() was performed)
   pthread_mutex_t mutex;
 } Task;
 
 // Storage compartment.
 struct SharedStorage {
     sem_t mutex;
+    sem_t executorLoopMutex;
 };
 
 Task tasks[MAX_N_TASKS];
@@ -61,7 +62,6 @@ bool good_command = false;
 void cleanStuff()
 {
   // Clean:
-  ASSERT_SYS_OK(sem_destroy(&(shared_storage->mutex)));
   for (int i = 0; i < tasksSize; i++) {
     ASSERT_ZERO(pthread_join(wait_threads[i], NULL));
     close(tasks[i].read_err_dsc);
@@ -70,8 +70,12 @@ void cleanStuff()
     close(tasks[i].write_out_dsc);
     ASSERT_ZERO(pthread_join(readSTDOUT_threads[i], NULL));
     ASSERT_ZERO(pthread_join(readSTDERR_threads[i], NULL));
-    ASSERT_SYS_OK(pthread_mutex_destroy(&(tasks[tasksSize].mutex)));
+    ASSERT_SYS_OK(pthread_mutex_destroy(&(tasks[i].mutex)));
   }
+  ASSERT_SYS_OK(sem_destroy(&(shared_storage->mutex)));
+  ASSERT_SYS_OK(sem_destroy(&(shared_storage->executorLoopMutex)));
+  munmap(shared_storage,  sizeof(struct SharedStorage));
+  close(-1);
 }
 
 void* constantlyWait(void * data)
@@ -85,11 +89,12 @@ void* constantlyWait(void * data)
     fprintf(stderr, "Task %d is already dead.\n", i);
     return 0;
   }
+  ASSERT_SYS_OK(sem_wait(&(shared_storage->executorLoopMutex)));
   if (WIFEXITED(exitStatus) != 0)
     printf("Task %d ended: status %d.\n", i, WEXITSTATUS(exitStatus));
   else
-    printf("Task %d ended: signalled.\n", i);      
-  tasks[i].isActive = false; 
+    printf("Task %d ended: signalled.\n", i); 
+  ASSERT_SYS_OK(sem_post(&(shared_storage->executorLoopMutex)));
   fprintf(stderr, "Finish thread waiting for pid: %d\n", task -> pid);
   return 0;
 }
@@ -110,7 +115,6 @@ void* constantlyReadSTDOUT(void * data)
     fprintf(stderr, "Thread read out: %s\n", out_buffer);
     strcpy(task -> lastReadOut, out_buffer);
     ASSERT_SYS_OK(pthread_mutex_unlock(&(task->mutex)));
-    //close(3);
   }
   fclose(stream);
   fprintf(stderr, "Exited reading thread loop\n");
@@ -133,20 +137,33 @@ void* constantlyReadSTDERR(void * data)
     fprintf(stderr, "Thread read err: %s\n", err_buffer);
     strcpy(task -> lastReadErr, err_buffer);
     ASSERT_SYS_OK(pthread_mutex_unlock(&(task->mutex)));
-    //close(5);
   }
   fclose(stream);
   fprintf(stderr, "Exited reading thread loop\n");
   return 0;
 }
 
+bool doesExist(pid_t pid)
+{
+  if (kill(pid, 0) == 0) {
+      // Process with PID exists
+      return true;
+  } else {
+      if (errno == ESRCH) {
+          // Process with PID does not exist
+      } else {
+          // An error occurred, but the process might exist
+      }
+      return false;
+  }
+}
+
 void endExec()
 {
   for (int i = 0; i < tasksSize; i++)
   {
-    if (tasks[i].isActive == false) // Child is already dead.
-      continue;
-    ASSERT_SYS_OK(kill(tasks[i].pid, SIGKILL));
+    if(doesExist(tasks[i].pid))
+      ASSERT_SYS_OK(kill(tasks[i].pid, SIGKILL));
   }
 }
 
@@ -164,14 +181,18 @@ int main()
   if (shared_storage == MAP_FAILED)
       syserr("mmap");
 
-  // Inicjalizacja semafora:
+  // Inicjalizacja semaforów:
   ASSERT_SYS_OK(sem_init(&(shared_storage->mutex), 1, 1));
+  ASSERT_SYS_OK(sem_init(&(shared_storage->executorLoopMutex), 1, 1));
 
   while (read_line(buffer, MAX_IN_SIZE, stdin)) {
 
+    ASSERT_SYS_OK(sem_wait(&(shared_storage->executorLoopMutex)));
+
     fprintf(stderr, "Zaczynam iteracje w while(getline()).\n");
     good_command = false;
-    // rozdzielamy polecenie od reszty linii
+
+    // Rozdzielanie linii wejścia.
     words = split_string(buffer);
 
     // obsługujemy polecenie run
@@ -193,7 +214,6 @@ int main()
       if (!child_pid)
       {
         // Child process.
-
         ASSERT_SYS_OK(dup2(pipe_dsc[1], STDOUT_FILENO));
         ASSERT_SYS_OK(close(pipe_dsc[0]));
         ASSERT_SYS_OK(close(pipe_dsc[1])); 
@@ -210,6 +230,7 @@ int main()
       else
       {
         ASSERT_SYS_OK(sem_wait(&(shared_storage->mutex)));
+        
         // Parent process.
         tasksSize++;
         tasks[tasksSize-1].pid = child_pid;
@@ -218,7 +239,6 @@ int main()
         tasks[tasksSize-1].write_out_dsc = pipe_dsc[1];
         tasks[tasksSize-1].write_err_dsc = pipe_err_dsc[1];
         tasks[tasksSize-1].nr = tasksSize - 1;
-        tasks[tasksSize-1].isActive = true;
         strcpy(tasks[tasksSize-1].lastReadOut, "");
         strcpy(tasks[tasksSize-1].lastReadErr, "");
         ASSERT_SYS_OK(pthread_mutex_init(&(tasks[tasksSize-1].mutex), 0));
@@ -257,7 +277,7 @@ int main()
       good_command = true;
       int T = atoi(words[1]);
       fprintf(stderr, "Kill process: %d.\n", T);
-      if (tasks[T].isActive)
+      if (doesExist(tasks[T].pid))
         ASSERT_SYS_OK(kill(tasks[T].pid, SIGINT));
     }
 
@@ -265,11 +285,13 @@ int main()
       good_command = true;
       int N = atoi(words[1]);
       fprintf(stderr, "Start sleep for %d ms.\n", N);
+      ASSERT_SYS_OK(sem_post(&(shared_storage->executorLoopMutex)));
       usleep(N*1000);
+      ASSERT_SYS_OK(sem_wait(&(shared_storage->executorLoopMutex)));
     }
 
     if (strcmp(words[0], "") == 0) {
-      // Just empty line.
+      // Just an empty line.
       good_command = true;
     }
 
@@ -278,6 +300,7 @@ int main()
       fprintf(stderr, "Quit.\n");
       endExec();
       free_split_string(words);
+      ASSERT_SYS_OK(sem_post(&(shared_storage->executorLoopMutex)));
       break;
     }
 
@@ -287,6 +310,8 @@ int main()
     }
 
     free_split_string(words);
+
+    ASSERT_SYS_OK(sem_post(&(shared_storage->executorLoopMutex)));
   }
 
   fprintf(stderr, "End of while loop\n");
